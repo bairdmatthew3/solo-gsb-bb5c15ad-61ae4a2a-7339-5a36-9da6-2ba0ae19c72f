@@ -298,6 +298,12 @@ function makeConflict(reason, a, b, anchor) {
 function detectCrossConflicts(opsA, opsB) {
   const conflicts = [];
   const dropped = new Set(); // deduplicated / shadowed op ids
+  // Equal-value writes: dropped op id -> id of the surviving op it
+  // duplicates. Recorded so downstream consumers (e.g. provenance) can
+  // attribute the leaf to BOTH sides. remove/remove and shadowed descendant
+  // removes are not recorded: their target is absent from the merged
+  // document, so there is nothing to attribute.
+  const duplicates = new Map();
   for (const a of opsA) {
     if (dropped.has(a.id)) continue;
     for (const b of opsB) {
@@ -318,13 +324,17 @@ function detectCrossConflicts(opsA, opsB) {
           continue;
         }
         if (a.op === 'replace' && b.op === 'replace') {
-          if (deepEqual(a.value, b.value)) dropped.add(b.id);
-          else conflicts.push(makeConflict(REASONS.REPLACE_MISMATCH, a, b));
+          if (deepEqual(a.value, b.value)) {
+            dropped.add(b.id);
+            duplicates.set(b.id, a.id);
+          } else conflicts.push(makeConflict(REASONS.REPLACE_MISMATCH, a, b));
           continue;
         }
         // Both create the same (previously missing) object member.
-        if (deepEqual(a.value, b.value)) dropped.add(b.id);
-        else conflicts.push(makeConflict(REASONS.ADD_MISMATCH, a, b));
+        if (deepEqual(a.value, b.value)) {
+          dropped.add(b.id);
+          duplicates.set(b.id, a.id);
+        } else conflicts.push(makeConflict(REASONS.ADD_MISMATCH, a, b));
         continue;
       }
 
@@ -343,7 +353,7 @@ function detectCrossConflicts(opsA, opsB) {
       conflicts.push(makeConflict(REASONS.REPLACE_OVERLAP, a, b, anc));
     }
   }
-  return { conflicts, dropped };
+  return { conflicts, dropped, duplicates };
 }
 
 /* ------------------------------- application ------------------------------ */
@@ -415,7 +425,7 @@ function applyArray(arr, ops) {
   return out;
 }
 
-function applyMerge(base, ops) {
+export function applyMerge(base, ops) {
   const rootOps = ops.filter((o) => o.segments.length === 0);
   const treeOps = ops.filter((o) => o.segments.length > 0);
   let doc = structuredClone(base);
@@ -426,10 +436,24 @@ function applyMerge(base, ops) {
 
 /* --------------------------------- entry --------------------------------- */
 
-export function mergePatches(base, patchA, patchB) {
+/**
+ * Full merge pipeline up to (but excluding) application: normalize both
+ * patches against the base, resolve intra-patch duplicates, detect
+ * cross-patch conflicts. Returns the normalized operations, the conflicts,
+ * the dropped-op bookkeeping and the surviving operations in application
+ * order ([A..., B...]). `duplicates` maps a dropped op id to the surviving
+ * op it duplicates (equal-value writes only).
+ */
+export function planMerge(base, patchA, patchB) {
   const opsA = resolveIntraPatch(normalizePatch(base, patchA, 'A'), 'A');
   const opsB = resolveIntraPatch(normalizePatch(base, patchB, 'B'), 'B');
-  const { conflicts, dropped } = detectCrossConflicts(opsA, opsB);
+  const { conflicts, dropped, duplicates } = detectCrossConflicts(opsA, opsB);
+  const surviving = [...opsA, ...opsB].filter((o) => !dropped.has(o.id));
+  return { opsA, opsB, conflicts, dropped, duplicates, surviving };
+}
+
+export function mergePatches(base, patchA, patchB) {
+  const { opsA, opsB, conflicts, dropped, surviving } = planMerge(base, patchA, patchB);
   conflicts.sort(
     (x, y) => x.path.localeCompare(y.path) || x.reason.localeCompare(y.reason),
   );
@@ -443,7 +467,6 @@ export function mergePatches(base, patchA, patchB) {
   if (conflicts.length) {
     return { status: 'conflict', merged: null, conflicts, stats };
   }
-  const surviving = [...opsA, ...opsB].filter((o) => !dropped.has(o.id));
   stats.applied = surviving.length;
   const merged = applyMerge(base, surviving);
   return { status: 'clean', merged, conflicts: [], stats };
