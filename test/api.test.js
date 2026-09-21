@@ -446,3 +446,107 @@ test('round-trip-plan for an unknown id returns 404', async () => {
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().error, 'Not Found');
 });
+
+/* ----------------------------- GET .../provenance ------------------------- */
+
+test('provenance on a clean record attributes every merged leaf and is path-sorted', async () => {
+  const record = await createMerge(EXAMPLE_REQUEST);
+  assert.equal(record.status, 'clean');
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/provenance`,
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.id, record.id);
+  assert.equal(body.status, 'clean');
+  assert.equal(body.createdAt, record.createdAt);
+
+  const byPath = Object.fromEntries(body.provenance.map((e) => [e.path, e]));
+  // base / A / B / both all appear
+  assert.equal(byPath['/app'].source, 'base');
+  assert.deepEqual(byPath['/app'].contributors, []);
+  assert.equal(byPath['/replicas'].source, 'A');
+  assert.deepEqual(byPath['/replicas'].contributors, [{ side: 'A', index: 0 }]);
+  assert.equal(byPath['/features/retries'].source, 'B');
+  assert.deepEqual(byPath['/features/retries'].contributors, [{ side: 'B', index: 2 }]);
+  assert.equal(byPath['/features/tracing'].source, 'both');
+  assert.deepEqual(byPath['/features/tracing'].contributors, [
+    { side: 'A', index: 2 },
+    { side: 'B', index: 3 },
+  ]);
+
+  // same-gap inserts + removal relocate leaves to their FINAL pointers:
+  // merged.servers = [a2 (A#1), b2 (B#1), b.internal (base)]
+  assert.equal(byPath['/servers/0/host'].source, 'A');
+  assert.equal(byPath['/servers/1/host'].source, 'B');
+  assert.equal(byPath['/servers/2/host'].source, 'base');
+  // the removed base element leaves no /servers/3 leaves
+  assert.equal(byPath['/servers/3/host'], undefined);
+
+  // sorted by path, unique
+  const paths = body.provenance.map((e) => e.path);
+  assert.deepEqual(paths, [...paths].sort());
+  assert.equal(new Set(paths).size, paths.length);
+});
+
+test('provenance locates same-gap inserts and deep edits at final array indices', async () => {
+  const record = await createMerge({
+    base: { list: [{ n: 1 }, { n: 2 }, { n: 3 }] },
+    patchA: [
+      { op: 'add', path: '/list/0', value: { n: 99 } },
+      { op: 'replace', path: '/list/2/n', value: 33 },
+    ],
+    patchB: [{ op: 'remove', path: '/list/0' }],
+  });
+  assert.equal(record.status, 'clean');
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/provenance`,
+  });
+  assert.equal(res.statusCode, 200);
+  const byPath = Object.fromEntries(res.json().provenance.map((e) => [e.path, e]));
+  assert.deepEqual(byPath['/list/0/n'].contributors, [{ side: 'A', index: 0 }]);
+  assert.equal(byPath['/list/1/n'].source, 'base');
+  assert.deepEqual(byPath['/list/2/n'].contributors, [{ side: 'A', index: 1 }]);
+});
+
+test('provenance on a conflict record returns 409 and does not modify it', async () => {
+  const record = await createMerge(EXAMPLE_CONFLICT_REQUEST);
+  assert.equal(record.status, 'conflict');
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/provenance`,
+  });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.json().error, 'Conflict');
+  assert.match(res.json().message, /conflict/);
+  const fetched = await app.inject({ method: 'GET', url: `/api/v1/merges/${record.id}` });
+  assert.equal(fetched.json().status, 'conflict');
+  assert.equal(fetched.json().merged, null);
+});
+
+test('provenance for an unknown id returns 404', async () => {
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/v1/merges/no-such-record/provenance',
+  });
+  assert.equal(res.statusCode, 404);
+  assert.equal(res.json().error, 'Not Found');
+});
+
+test('provenance answers are byte-for-byte identical on repeated queries', async () => {
+  const record = await createMerge(EXAMPLE_REQUEST);
+  const url = `/api/v1/merges/${record.id}/provenance`;
+  const first = await app.inject({ method: 'GET', url });
+  const second = await app.inject({ method: 'GET', url });
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(first.body, second.body);
+});
+
+test('provenance is listed in the service endpoint index', async () => {
+  const res = await app.inject({ method: 'GET', url: '/' });
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.json().endpoints['GET /api/v1/merges/:id/provenance']);
+});

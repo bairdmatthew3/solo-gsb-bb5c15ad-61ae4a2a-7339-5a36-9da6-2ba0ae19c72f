@@ -4,6 +4,7 @@ import { mergePatches, PatchError } from './merge.js';
 import { auditOrdering } from './audit.js';
 import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
 import { buildRoundTripPlan } from './roundtrip.js';
+import { buildProvenance } from './provenance.js';
 import { MergeStore } from './store.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
@@ -66,6 +67,8 @@ export function buildApp(options = {}) {
   const audits = new WeakMap();
   // Round-trip plans are likewise pure functions of the saved base/merged.
   const plans = new WeakMap();
+  // Provenance reports are pure functions of the saved inputs; cache likewise.
+  const provenanceReports = new WeakMap();
   const startedAt = Date.now();
 
   app.setNotFoundHandler((req, reply) => {
@@ -113,6 +116,8 @@ export function buildApp(options = {}) {
         'preview per-conflict winner decisions (A/B) on a conflict record without modifying it',
       'GET /api/v1/merges/:id/round-trip-plan':
         'deterministic RFC 6902 forward (base -> merged) and rollback (merged -> base) patches, replayed server-side',
+      'GET /api/v1/merges/:id/provenance':
+        'per-leaf origin (base/A/B/both) in merged with the contributing original operation indices, relocated to final JSON Pointers',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -222,6 +227,38 @@ export function buildApp(options = {}) {
       forward: plan.forward,
       rollback: plan.rollback,
       operationCount: plan.operationCount,
+    };
+  });
+
+  app.get('/api/v1/merges/:id/provenance', async (req, reply) => {
+    const record = store.get(req.params.id);
+    if (!record) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: 'Not Found',
+        message: `no rehearsal stored with id ${req.params.id}`,
+      });
+    }
+    if (record.status !== 'clean') {
+      // Conflict records have no merged document to attribute leaves to.
+      return reply.code(409).send({
+        statusCode: 409,
+        error: 'Conflict',
+        message:
+          `rehearsal ${req.params.id} has status "${record.status}"; ` +
+          'provenance requires a clean merge record',
+      });
+    }
+    let result = provenanceReports.get(record);
+    if (!result) {
+      result = buildProvenance(record.base, record.patchA, record.patchB);
+      provenanceReports.set(record, result);
+    }
+    return {
+      id: record.id,
+      createdAt: record.createdAt,
+      status: record.status,
+      provenance: result.provenance,
     };
   });
 

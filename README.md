@@ -57,6 +57,7 @@ npm ci && npm start
 | `GET` | `/api/v1/merges/:id/order-audit` | 对已保存输入按严格 RFC 6902 顺序重放 A→B 与 B→A，判定可交换性 |
 | `POST` | `/api/v1/merges/:id/resolution-preview` | 对冲突记录按冲突序号提交胜方决定（A/B），预览解决结果（不修改记录） |
 | `GET` | `/api/v1/merges/:id/round-trip-plan` | 为干净合并记录生成确定性 RFC 6902 forward（base→merged）/ rollback（merged→base）补丁，服务端重放校验后返回 |
+| `GET` | `/api/v1/merges/:id/provenance` | 为干净合并记录列出 merged 中每个叶子路径的来源（base / A / B / both）及贡献操作原始序号，定位到最终 JSON Pointer |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
 ### `POST /api/v1/merges`
@@ -318,6 +319,85 @@ curl -s -X POST "http://localhost:3000/api/v1/merges/$id/resolution-preview" \
 curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq
 ```
 
+### `GET /api/v1/merges/:id/provenance`（叶子来源）
+
+对一条**已保存且合并成功（`status: "clean"`）**的记录，列出 `merged` 中**每个叶子路径**的来源，
+以及贡献了该叶子的**原始操作序号**。叶子定义为标量/`null`，或**空对象/空数组**（容器内不再有
+子节点）；非空容器本身不是叶子。
+
+每个来源条目：
+
+- `source`：
+  - `"base"`——该叶子与基准文档一致，未被任何补丁写入（`contributors` 为空数组）；
+  - `"A"` / `"B"`——仅由一组补丁写入；
+  - `"both"`——**两组补丁以相同值写入同一目标**（基准坐标合并里这类操作去重为只应用一次，
+    但来源记为双方）。
+- `contributors`：贡献操作列表，每项仅含 `side`（`"A"`/`"B"`）与 `index`（该操作在其
+  **原始补丁**中的序号，0 起），按 (side, index) 排序。`"both"` 时双方序号都会列出。
+
+来源归属严格沿用 `POST /api/v1/merges` 的**基准坐标合并的数组重定位规则**：
+
+- **后写覆盖**：同一补丁内对同一目标的多次非插入写操作只有最后一条生效，被覆盖的旧操作
+  **不计入**贡献者；
+- **相同值双边写入记 `both`**：双方相同的 `replace`、相同的新增对象成员（`add`）应用一次，
+  两条原始序号都计入；双方相同的 `remove` 使叶子消失（不出现在结果中）；
+- **删除后重建**：同一成员先 `remove` 后 `add`/`replace` 归到最后的写入操作；数组中对某基准
+  元素的删除与同缝隙插入并存时，插入值归插入操作；
+- **数组同缝隙插入**：同一缝隙的插入按 **A 后 B**（同侧保持补丁内顺序）落位；插入、删除、
+  替换、深层修改都按**基准元素身份**重定位，每个贡献者标注的路径都是其在最终 `merged` 中的
+  **最终 JSON Pointer**（与执行下标无关）；
+- **整体替换子树**：对某路径的 `add`/`replace` 使其子树内所有叶子都归属于该操作；
+- **深层删除清空容器**：若深层 `remove` 删掉容器内最后一个叶子，残留的空对象/空数组本身成为
+  一个 `"base"` 叶子。
+
+#### 响应结构（`200`）
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "status": "clean",
+  "provenance": [
+    { "path": "/app",                 "source": "base", "contributors": [] },
+    { "path": "/features/cache",      "source": "base", "contributors": [] },
+    { "path": "/features/retries",    "source": "B",    "contributors": [{ "side": "B", "index": 2 }] },
+    { "path": "/features/tracing",    "source": "both", "contributors": [
+      { "side": "A", "index": 2 }, { "side": "B", "index": 3 }
+    ] },
+    { "path": "/replicas",            "source": "A",    "contributors": [{ "side": "A", "index": 0 }] },
+    { "path": "/servers/0/host",      "source": "A",    "contributors": [{ "side": "A", "index": 1 }] },
+    { "path": "/servers/1/host",      "source": "B",    "contributors": [{ "side": "B", "index": 1 }] },
+    { "path": "/servers/2/host",      "source": "base", "contributors": [] }
+    // …merged 中其余叶子
+  ]
+}
+```
+
+上例即 `examples/merge-request.json`：B 删除了基准 `servers[0]`、A 与 B 又都在缝隙 1 插入，
+最终数组为 `[a2(A#1), b2(B#1), b.internal(base)]`，各叶子按**最终下标**定位；双方对
+`/features/tracing` 的相同写入记为 `both`。
+
+#### 路径、排序与确定性
+
+- `path` 为 RFC 6901 JSON Pointer（`~` → `~0`、`/` → `~1`），文档根标量的路径为 `""`；
+- 条目按**转义后的路径字符串**排序（UTF-16 码元字典序，跨运行稳定），路径不重复；
+- 报告是已保存输入的纯函数并按记录缓存：**同一记录重复请求逐字节一致**；
+- 服务端还会校验归属遍历覆盖的叶子集合与 `merged` 的实际叶子集合**完全一致**（正常输入下
+  恒成立）。
+
+#### 状态码
+
+- **干净记录 → `200`**：返回上述报告。
+- **冲突记录（`status: "conflict"`）→ `409`**：冲突记录没有 `merged`，不生成来源报告，
+  且**不修改记录**；返回 `{ statusCode, error: "Conflict", message }`。
+- **记录不存在 → `404`**。
+
+示例：
+
+```bash
+curl -s http://localhost:3000/api/v1/merges/<id>/provenance | jq
+```
+
 ## 示例请求
 
 干净合并（也见 `examples/merge-request.json`，或 `GET /api/v1/example`）：
@@ -402,6 +482,7 @@ curl -s -X POST http://localhost:3000/api/v1/merges/<id>/resolution-preview \
   -H 'Content-Type: application/json' \
   -d @examples/resolution-preview-request.json | jq       # 冲突解决预览
 curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq  # forward / rollback 补丁
+curl -s http://localhost:3000/api/v1/merges/<id>/provenance | jq       # 每个叶子的来源 base/A/B/both
 curl -s -X DELETE http://localhost:3000/api/v1/merges/<id> # 删除记录
 ```
 
@@ -461,10 +542,12 @@ npm test
 非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查，顺序审计的
 可交换 / 发散（RFC 6901 字典序最小差异）/ 失败（失败方、原始序号、失败前文档）判定与
 重复查询确定性，冲突解决预览的胜方保留 / 败方剔除、覆盖校验（`400`）、
-矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性，以及往返补丁计划的
+矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性，往返补丁计划的
 对象字典序与 JSON Pointer 转义、数组 LCS 对齐（删除降序 / 插入升序）、根替换、
 前向与回滚重放校验、操作数统计、干净记录可用 / 冲突记录 `409` 且不改记录 / 未知 `404`
-与重复请求逐字节一致等。
+与重复请求逐字节一致，以及叶子来源报告的 base/A/B/both 归属、后写覆盖、相同值双边写入、
+删除后重建、数组同缝隙插入与索引漂移的最终 JSON Pointer 定位、空容器叶子、路径排序、
+干净记录可用 / 冲突记录 `409` / 未知 `404` 与重复请求逐字节一致等。
 
 ## 项目结构
 
@@ -477,6 +560,7 @@ npm test
 │   ├── audit.js               # 顺序审计：严格 RFC 6902 顺序重放 A→B / B→A、失败捕获、字典序最小差异
 │   ├── resolution.js          # 冲突解决预览：胜方决定校验 → 剔除败方 → 复用合并引擎（纯函数，不写存储）
 │   ├── roundtrip.js           # 往返补丁：字典序对象 diff + 数组 LCS（删除降序/插入升序）→ RFC 6902 forward/rollback，服务端重放校验
+│   ├── provenance.js          # 叶子来源：沿用基准坐标重定位规则遍历 base/merged，逐叶子标注 base/A/B/both 与原始操作序号
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
 ├── test/                      # node:test 单元 + 集成测试
@@ -495,3 +579,7 @@ npm test
 - 往返补丁（`GET /api/v1/merges/:id/round-trip-plan`）由 `base` 与 `merged` 的确定性
   diff 生成（仅 add/remove/replace；数组按 LCS 对齐、删除降序、插入升序），服务端重放
   校验前向与回滚均成立后才返回，并按记录缓存；仅干净合并记录可用，冲突记录返回 `409`。
+- 叶子来源（`GET /api/v1/merges/:id/provenance`）在基准坐标模型下逐叶子标注来源
+  （base/A/B/both）与贡献操作的原始序号，数组按基准身份重定位到最终 JSON Pointer，
+  并校验覆盖的叶子集合与 `merged` 完全一致；结果按记录缓存，重复查询逐字节一致；
+  仅干净合并记录可用，冲突记录返回 `409`。
